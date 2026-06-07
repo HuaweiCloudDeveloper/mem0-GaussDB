@@ -268,14 +268,18 @@ Payloads and JSONB exact filter values must be valid JSON for GaussDB `JSONB`. N
 
 The provider follows Mem0's shared metadata filter DSL for wildcard and null values:
 
-- wildcard `*`
-- `null`
+- bare `*` matches rows where the selected payload key exists, regardless of the key's value
+- `null` matches JSON `null` exactly
+
+Wildcard checks use the JSONB payload key-exists operator for every field, including redundant scope fields such as `user_id`, `agent_id`, and `run_id`. The redundant scope columns are still used for value filters such as `eq` and `in`, but they are not used for wildcard checks because a `TEXT` column cannot distinguish a missing JSON key from a key whose JSON value is `null`.
 
 Examples:
 
 ```python
-{"category": "*"}
-{"optional": None}
+{"category": "*"}        # category key exists in payload
+{"user_id": "*"}         # user_id key exists in payload; not user_id IS NOT NULL
+{"category": {"eq": "*"}}  # category equals the literal string "*"
+{"optional": None}       # optional equals JSON null
 ```
 
 For direct provider calls, supported operators on the same field are combined with `AND`. That means merged filters such as `{"price": {"gte": 5, "lte": 100, "ne": 50}}` are executed as one same-field conjunction instead of degrading to an exact object match.

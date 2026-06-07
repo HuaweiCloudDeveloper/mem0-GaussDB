@@ -618,6 +618,9 @@ class GaussDB(VectorStoreBase):
                     ) {self._create_table_suffix_sql("id")}
                     """
                 )
+                if self.deployment_mode != "distributed":
+                    self.bm25_enabled = True
+                    self.capabilities.bm25 = True
                 self._ensure_indexes(cur, table, embedding_dims=dims)
 
         return self._run_with_retry("create_col", op)
@@ -1206,32 +1209,35 @@ class GaussDB(VectorStoreBase):
                         expressions.append(f"(({result.expression}) IS NOT TRUE)")
                         params.extend(result.params)
             else:
-                ops_map = self._normalize_field_value(value)
-                result = self._build_field_clauses(normalized_key, ops_map)
+                result = self._build_field_filter_result(normalized_key, value)
                 if result.expression:
                     expressions.append(result.expression)
                     params.extend(result.params)
         return _FilterBuildResult(expression=" AND ".join(expressions), params=params)
 
     def _build_field_filter(self, key: str, value: Any) -> Tuple[str, List[Any]]:
-        ops_map = self._normalize_field_value(value)
-        result = self._build_field_clauses(key, ops_map)
+        result = self._build_field_filter_result(key, value)
         return result.expression, result.params
+
+    def _build_field_filter_result(self, key: str, value: Any) -> _FilterBuildResult:
+        if value == "*":
+            return self._build_field_exists_clause(key)
+        ops_map = self._normalize_field_value(value)
+        return self._build_field_clauses(key, ops_map)
+
+    def _build_field_exists_clause(self, key: str) -> _FilterBuildResult:
+        self._validate_filter_key(key)
+        return _FilterBuildResult(expression="payload ? %s", params=[key])
 
     def _normalize_field_value(self, value: Any) -> Dict[str, Any]:
         if isinstance(value, dict):
             return dict(value)
-        if value == "*":
-            return {"wildcard": True}
         if isinstance(value, list):
             return {"in": value}
         return {"eq": value}
 
     def _build_field_clauses(self, key: str, ops_map: Dict[str, Any]) -> _FilterBuildResult:
         self._validate_filter_key(key)
-        if ops_map.get("wildcard") is True and len(ops_map) == 1:
-            return _FilterBuildResult(expression="", params=[])
-
         ops = set(ops_map.keys())
         unsupported_ops = ops - _SUPPORTED_FILTER_OPERATORS
         if unsupported_ops:
