@@ -690,7 +690,7 @@ def test_search_typed_bool_filter_uses_jsonb_equality():
     assert results[0].id == "id1"
 
 
-def test_search_wildcard_filter_is_skipped_not_literal_match():
+def test_search_star_payload_filter_uses_jsonb_key_exists():
     db, _, _, mock_cursor = make_gaussdb()
     mock_cursor.fetchall.return_value = []
 
@@ -698,11 +698,12 @@ def test_search_wildcard_filter_is_skipped_not_literal_match():
 
     sql = executed_sql(mock_cursor)
     params = mock_cursor.execute.call_args.args[1]
-    assert "category" not in sql
-    assert params == ("[0.1,0.2,0.3]", "u1", 5)
+    assert "payload ? %s" in sql
+    assert "payload->%s = %s::JSONB" not in sql
+    assert params == ("[0.1,0.2,0.3]", "u1", "category", 5)
 
 
-def test_search_wildcard_scope_filter_is_skipped_not_literal_match():
+def test_search_star_scope_filter_uses_payload_key_exists_not_redundant_column():
     db, _, _, mock_cursor = make_gaussdb()
     mock_cursor.fetchall.return_value = []
 
@@ -710,21 +711,24 @@ def test_search_wildcard_scope_filter_is_skipped_not_literal_match():
 
     sql = executed_sql(mock_cursor)
     params = mock_cursor.execute.call_args.args[1]
+    assert "payload ? %s" in sql
     assert '"user_id" = %s' not in sql
-    assert params == ("[0.1,0.2,0.3]", 5)
+    assert '"user_id" IS NOT NULL' not in sql
+    assert params == ("[0.1,0.2,0.3]", "user_id", 5)
 
 
-def test_search_all_wildcard_metadata_filters_do_not_leave_dangling_and():
+def test_search_star_metadata_filters_are_jsonb_key_exists_matches():
     db, _, _, mock_cursor = make_gaussdb()
     mock_cursor.fetchall.return_value = []
 
     db.search("hello", [0.1, 0.2, 0.3], filters={"category": "*", "tag": "*"})
 
     sql = executed_sql(mock_cursor)
-    assert "WHERE" not in sql or "WHERE  ORDER" not in sql
+    params = mock_cursor.execute.call_args.args[1]
+    assert sql.count("payload ? %s") == 2
+    assert "payload->%s = %s::JSONB" not in sql
     assert "AND  ORDER" not in sql
-    assert "category" not in sql
-    assert "tag" not in sql
+    assert params == ("[0.1,0.2,0.3]", "category", "tag", 5)
 
 
 def test_search_eq_null_uses_jsonb_null_equality():
@@ -1916,6 +1920,57 @@ def test_ensure_indexes_skips_bm25_when_disabled():
     filter_idx.assert_called_once()
 
 
+def test_create_col_retries_bm25_index_creation_for_centralized_collection():
+    db, *_ = make_gaussdb()
+    db.bm25_enabled = False
+    db.capabilities.bm25 = False
+
+    with (
+        patch.object(db, "_create_vector_index"),
+        patch.object(db, "_create_bm25_index") as bm25_idx,
+        patch.object(db, "_create_filter_indexes"),
+    ):
+        db.create_col()
+
+    bm25_idx.assert_called_once()
+    assert db.bm25_enabled is True
+    assert db.capabilities.bm25 is True
+
+
+def test_reset_retries_bm25_index_creation_for_centralized_collection():
+    db, *_ = make_gaussdb()
+    db.bm25_enabled = False
+    db.capabilities.bm25 = False
+
+    with (
+        patch.object(db, "delete_col"),
+        patch.object(db, "_create_vector_index"),
+        patch.object(db, "_create_bm25_index") as bm25_idx,
+        patch.object(db, "_create_filter_indexes"),
+    ):
+        db.reset()
+
+    bm25_idx.assert_called_once()
+    assert db.bm25_enabled is True
+    assert db.capabilities.bm25 is True
+
+
+def test_reset_keeps_bm25_disabled_for_distributed_collection():
+    db, *_ = make_gaussdb(deployment_mode="distributed", embedding_model_dims=512)
+
+    with (
+        patch.object(db, "delete_col"),
+        patch.object(db, "_create_vector_index"),
+        patch.object(db, "_create_bm25_index") as bm25_idx,
+        patch.object(db, "_create_filter_indexes"),
+    ):
+        db.reset()
+
+    bm25_idx.assert_not_called()
+    assert db.bm25_enabled is False
+    assert db.capabilities.bm25 is False
+
+
 def test_insert_validates_lengths_and_handles_empty_rows():
     db, *_ = make_gaussdb()
     with pytest.raises(ValueError):
@@ -2063,12 +2118,16 @@ def test_build_filter_expression_and_field_helpers_cover_error_and_edge_paths():
     assert " OR " in expr
     assert params == ["u1", "u2", "u3"]
 
-    assert db._build_field_filter("category", "*") == ("", [])
+    assert db._build_field_filter("category", "*") == ("payload ? %s", ["category"])
+    assert db._build_field_filter("user_id", "*") == ("payload ? %s", ["user_id"])
     with pytest.raises(ValueError, match="Unsupported filter operator"):
         db._build_field_filter("category", {"regex": "x"})
     expr, params = db._build_field_filter("category", {"eq": "*"})
     assert expr == "payload->%s = %s::JSONB"
     assert params == ["category", '"*"']
+    expr, params = db._build_field_filter("user_id", {"eq": "*"})
+    assert expr == '"user_id" = %s'
+    assert params == ["*"]
 
     assert db._field_in_expression("category", [], negate=False) == ("1 = 0", [])
     assert db._field_in_expression("category", [], negate=True) == ("1 = 1", [])
@@ -2307,11 +2366,16 @@ def test_delete_col_executes_drop_statements():
     assert db.collection_name in sqls
 
 
-def test_build_filter_expression_skips_empty_subexpressions_and_not_branch():
+def test_build_filter_expression_preserves_star_as_key_exists_in_logical_filters():
     db, *_ = make_gaussdb()
+
     expr, params = db._build_filter_expression({"$and": [{"category": "*"}], "$not": [{"category": "*"}]})
-    assert expr == ""
-    assert params == []
+    assert expr == "((payload ? %s)) AND ((payload ? %s) IS NOT TRUE)"
+    assert params == ["category", "category"]
+
+    expr, params = db._build_filter_expression({"$or": [{"category": "*"}, {"user_id": "u1"}]})
+    assert expr == '((payload ? %s) OR ("user_id" = %s))'
+    assert params == ["category", "u1"]
 
 
 def test_build_filter_expression_wraps_or_group_before_top_level_and():
