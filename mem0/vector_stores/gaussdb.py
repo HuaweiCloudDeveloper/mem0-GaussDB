@@ -53,6 +53,9 @@ _RETRYABLE_ERROR_FRAGMENTS = (
     "serialization failure",
     "server closed",
     "terminating connection",
+    "unexpected eof",
+    "eof while reading",
+    "memory is temporarily unavailable",
 )
 _CONNECTION_ERROR_FRAGMENTS = (
     "connection already closed",
@@ -60,6 +63,8 @@ _CONNECTION_ERROR_FRAGMENTS = (
     "connection reset",
     "connection refused",
     "eof detected",
+    "unexpected eof",
+    "eof while reading",
     "server closed",
     "ssl connection has been closed",
     "terminating connection",
@@ -70,6 +75,7 @@ _BM25_UNAVAILABLE_ERROR_FRAGMENTS = (
 )
 _DEFAULT_VECTOR_INDEX_MAINTENANCE_WORK_MEM = "256MB"
 _HIGH_DIM_VECTOR_INDEX_MAINTENANCE_WORK_MEM = "2GB"
+_INTERNAL_MEM0_COLLECTIONS = {"mem0migrations"}
 _SUPPORTED_FILTER_OPERATORS = {
     "eq",
     "ne",
@@ -226,28 +232,31 @@ class GaussDB(VectorStoreBase):
             collections = self.list_cols()
             if self.collection_name not in collections:
                 self.create_col()
-            elif self.bm25_enabled:
-                # Collection exists; verify a BM25 index is actually usable
-                # rather than assuming bm25_enabled from deployment_mode alone.
+            else:
                 with self._get_cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT 1
-                        FROM pg_index pi
-                        JOIN pg_class idx_cls ON pi.indexrelid = idx_cls.oid
-                        JOIN pg_am am ON idx_cls.relam = am.oid
-                        JOIN pg_class tbl_cls ON pi.indrelid = tbl_cls.oid
-                        JOIN pg_namespace ns ON tbl_cls.relnamespace = ns.oid
-                        WHERE ns.nspname = %s
-                          AND tbl_cls.relname = %s
-                          AND am.amname = 'bm25'
-                          AND pi.indisvalid IS TRUE
-                          AND pi.indisusable IS TRUE
-                        """,
-                        (self.schema_name, self.collection_name),
-                    )
-                    self.bm25_enabled = cur.fetchone() is not None
-                    self.capabilities.bm25 = self.bm25_enabled
+                    if self._should_validate_existing_vector_dimension():
+                        self._ensure_existing_vector_dimension(cur, self.embedding_model_dims)
+                    if self.bm25_enabled:
+                        # Collection exists; verify a BM25 index is actually usable
+                        # rather than assuming bm25_enabled from deployment_mode alone.
+                        cur.execute(
+                            """
+                            SELECT 1
+                            FROM pg_index pi
+                            JOIN pg_class idx_cls ON pi.indexrelid = idx_cls.oid
+                            JOIN pg_am am ON idx_cls.relam = am.oid
+                            JOIN pg_class tbl_cls ON pi.indrelid = tbl_cls.oid
+                            JOIN pg_namespace ns ON tbl_cls.relnamespace = ns.oid
+                            WHERE ns.nspname = %s
+                              AND tbl_cls.relname = %s
+                              AND am.amname = 'bm25'
+                              AND pi.indisvalid IS TRUE
+                              AND pi.indisusable IS TRUE
+                            """,
+                            (self.schema_name, self.collection_name),
+                        )
+                        self.bm25_enabled = cur.fetchone() is not None
+                        self.capabilities.bm25 = self.bm25_enabled
 
     @staticmethod
     def _validate_choice(value: str, field_name: str, choices: set[str]) -> str:
@@ -605,6 +614,8 @@ class GaussDB(VectorStoreBase):
         def op():
             with self._get_cursor(commit=True) as cur:
                 self._ensure_schema(cur)
+                if self._should_validate_existing_vector_dimension():
+                    self._ensure_existing_vector_dimension(cur, dims)
                 cur.execute(
                     f"""
                     CREATE TABLE IF NOT EXISTS {table} (
@@ -624,6 +635,47 @@ class GaussDB(VectorStoreBase):
                 self._ensure_indexes(cur, table, embedding_dims=dims)
 
         return self._run_with_retry("create_col", op)
+
+    def _should_validate_existing_vector_dimension(self) -> bool:
+        return self.collection_name not in _INTERNAL_MEM0_COLLECTIONS
+
+    def _ensure_existing_vector_dimension(self, cur, expected_dims: int) -> None:
+        existing_dims = self._existing_vector_dimension(cur)
+        if existing_dims is not None and existing_dims != expected_dims:
+            raise ValueError(
+                f"Existing GaussDB collection {self.collection_name!r} has vector dimension "
+                f"{existing_dims}, but embedding_model_dims={expected_dims}. Use a different "
+                "collection_name for a different embedding model dimension, or recreate "
+                "the collection."
+            )
+
+    def _existing_vector_dimension(self, cur) -> Optional[int]:
+        cur.execute(
+            """
+            SELECT a.atttypmod
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s
+              AND c.relname = %s
+              AND a.attname = 'vector'
+              AND NOT a.attisdropped
+            """,
+            (self.schema_name, self.collection_name),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        raw_dimension = row[0]
+        if isinstance(raw_dimension, bool):
+            return None
+        if isinstance(raw_dimension, int):
+            dimension = raw_dimension
+        elif isinstance(raw_dimension, str) and raw_dimension.strip().isdigit():
+            dimension = int(raw_dimension.strip())
+        else:
+            return None
+        return dimension if dimension > 0 else None
 
     def _create_vector_index(self, cur, table: str, embedding_dims: Optional[int] = None):
         index_name = self._quote_identifier(self._index_name(self.collection_name, "vector_idx"))
