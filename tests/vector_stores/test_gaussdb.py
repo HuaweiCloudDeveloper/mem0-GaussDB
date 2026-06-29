@@ -379,6 +379,69 @@ def test_create_col_generates_ustore_vector_bm25_and_filter_indexes():
     mock_conn.commit.assert_called()
 
 
+def test_create_col_rejects_existing_collection_dimension_mismatch():
+    db, _, _, mock_cursor = make_gaussdb(embedding_model_dims=3)
+    mock_cursor.fetchone.return_value = (4,)
+
+    with pytest.raises(ValueError, match="Existing GaussDB collection .* vector dimension 4"):
+        db.create_col()
+
+
+def test_create_col_skips_dimension_check_for_internal_telemetry_collection():
+    db, _, mock_conn, mock_cursor = make_gaussdb(collection_name="mem0migrations", embedding_model_dims=3)
+    mock_cursor.fetchone.return_value = (4,)
+
+    db.create_col()
+
+    sql = executed_sql(mock_cursor)
+    assert "a.atttypmod" not in sql
+    assert "CREATE TABLE IF NOT EXISTS" in sql
+    mock_conn.commit.assert_called()
+
+
+def test_create_col_accepts_existing_collection_same_dimension():
+    db, _, mock_conn, mock_cursor = make_gaussdb(embedding_model_dims=3)
+    mock_cursor.fetchone.return_value = (3,)
+
+    db.create_col()
+
+    sql = executed_sql(mock_cursor)
+    assert "CREATE TABLE IF NOT EXISTS" in sql
+    assert "FLOATVECTOR(3)" in sql
+    mock_conn.commit.assert_called()
+
+
+def test_existing_vector_dimension_parses_typmod_and_ignores_unknown():
+    db, _, _, mock_cursor = make_gaussdb()
+
+    mock_cursor.fetchone.return_value = (1,)
+    assert db._existing_vector_dimension(mock_cursor) == 1
+
+    mock_cursor.fetchone.return_value = ("3",)
+    assert db._existing_vector_dimension(mock_cursor) == 3
+
+    mock_cursor.fetchone.return_value = (" 4 ",)
+    assert db._existing_vector_dimension(mock_cursor) == 4
+
+    mock_cursor.fetchone.return_value = ("floatvector(3)",)
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+    mock_cursor.fetchone.return_value = (True,)
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+    mock_cursor.fetchone.return_value = (0,)
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+    mock_cursor.fetchone.return_value = (-1,)
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+    mock_cursor.fetchone.return_value = (1.5,)
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+    mock_cursor.fetchone.return_value = None
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+
 def test_create_col_rejects_alternate_collection_name_but_accepts_matching_name():
     db, _, _, _ = make_gaussdb()
 
@@ -1480,6 +1543,8 @@ def test_is_retryable_classifies_known_fragments():
     assert GaussDB._is_retryable(Exception("could not serialize access")) is True
     assert GaussDB._is_retryable(Exception("server closed the connection")) is True
     assert GaussDB._is_retryable(Exception("terminating connection")) is True
+    assert GaussDB._is_retryable(Exception("SSL error: unexpected eof while reading")) is True
+    assert GaussDB._is_retryable(Exception("memory is temporarily unavailable")) is True
     assert GaussDB._is_retryable(Exception("syntax error")) is False
     assert GaussDB._is_retryable(Exception("unique violation")) is False
 
@@ -1639,6 +1704,17 @@ def test_get_cursor_discards_closed_connection_after_error():
     with pytest.raises(RuntimeError, match="boom"):
         with db._get_cursor(commit=False):
             raise RuntimeError("boom")
+
+    mock_conn.rollback.assert_called()
+    mock_pool.putconn.assert_called_with(mock_conn, close=True)
+
+
+def test_get_cursor_discards_connection_after_ssl_eof_error():
+    db, mock_pool, mock_conn, _ = make_gaussdb()
+
+    with pytest.raises(RuntimeError, match="unexpected eof"):
+        with db._get_cursor(commit=False):
+            raise RuntimeError("SSL error: unexpected eof while reading")
 
     mock_conn.rollback.assert_called()
     mock_pool.putconn.assert_called_with(mock_conn, close=True)
@@ -2183,8 +2259,8 @@ def test_init_auto_create_verifies_bm25_present_when_collection_exists():
     mock_conn.get_parameter_status.return_value = "UTF8"
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
-    # fetchone returns a row -> usable BM25 index exists
-    mock_cursor.fetchone.return_value = (1,)
+    # fetchone sequence: existing vector dimension, then usable BM25 index row.
+    mock_cursor.fetchone.side_effect = [(3,), (1,)]
     mock_cursor.fetchall.return_value = []
     mock_pool = MagicMock()
     mock_pool.getconn.return_value = mock_conn
@@ -2201,6 +2277,7 @@ def test_init_auto_create_verifies_bm25_present_when_collection_exists():
     # Verify the probe checks the real index access method and usable state,
     # not only the index definition text.
     sql = executed_sql(mock_cursor)
+    assert "a.atttypmod" in sql
     assert "FROM pg_index pi" in sql
     assert "JOIN pg_am am" in sql
     assert "am.amname = 'bm25'" in sql
@@ -2214,8 +2291,8 @@ def test_init_auto_create_detects_bm25_absent_when_collection_exists():
     mock_conn.get_parameter_status.return_value = "UTF8"
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
-    # fetchone returns None -> no valid/usable BM25 index found
-    mock_cursor.fetchone.return_value = None
+    # fetchone sequence: existing vector dimension, then no valid/usable BM25 index found.
+    mock_cursor.fetchone.side_effect = [(3,), None]
     mock_cursor.fetchall.return_value = []
     mock_pool = MagicMock()
     mock_pool.getconn.return_value = mock_conn
@@ -2230,11 +2307,60 @@ def test_init_auto_create_detects_bm25_absent_when_collection_exists():
     assert db.bm25_enabled is False
     assert db.capabilities.bm25 is False
     sql = executed_sql(mock_cursor)
+    assert "a.atttypmod" in sql
     assert "FROM pg_index pi" in sql
     assert "JOIN pg_am am" in sql
     assert "am.amname = 'bm25'" in sql
     assert "pi.indisvalid IS TRUE" in sql
     assert "pi.indisusable IS TRUE" in sql
+
+
+def test_init_auto_create_rejects_existing_collection_dimension_mismatch():
+    mock_conn = MagicMock()
+    mock_conn.get_parameter_status.return_value = "UTF8"
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.return_value = (4,)
+    mock_cursor.fetchall.return_value = []
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+
+    with (
+        patch.object(GaussDB, "_create_connection_pool", return_value=mock_pool),
+        patch.object(GaussDB, "list_cols", return_value=["test_collection"]),
+        patch.object(GaussDB, "create_col") as create_col,
+        pytest.raises(ValueError, match="Existing GaussDB collection .* vector dimension 4"),
+    ):
+        GaussDB(collection_name="test_collection", embedding_model_dims=3, auto_create=True)
+
+    create_col.assert_not_called()
+    sql = executed_sql(mock_cursor)
+    assert "a.atttypmod" in sql
+    assert "FROM pg_index pi" not in sql
+
+
+def test_init_auto_create_skips_dimension_check_for_internal_telemetry_collection():
+    mock_conn = MagicMock()
+    mock_conn.get_parameter_status.return_value = "UTF8"
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.return_value = (4,)
+    mock_cursor.fetchall.return_value = []
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+
+    with (
+        patch.object(GaussDB, "_create_connection_pool", return_value=mock_pool),
+        patch.object(GaussDB, "list_cols", return_value=["mem0migrations"]),
+        patch.object(GaussDB, "create_col") as create_col,
+    ):
+        db = GaussDB(collection_name="mem0migrations", embedding_model_dims=3, auto_create=True)
+
+    create_col.assert_not_called()
+    assert db.collection_name == "mem0migrations"
+    sql = executed_sql(mock_cursor)
+    assert "a.atttypmod" not in sql
+    assert "FROM pg_index pi" in sql
 
 
 def test_init_rejects_maxconn_less_than_minconn():
