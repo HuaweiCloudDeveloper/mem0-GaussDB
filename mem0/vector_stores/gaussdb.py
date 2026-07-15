@@ -53,6 +53,9 @@ _RETRYABLE_ERROR_FRAGMENTS = (
     "serialization failure",
     "server closed",
     "terminating connection",
+    "unexpected eof",
+    "eof while reading",
+    "memory is temporarily unavailable",
 )
 _CONNECTION_ERROR_FRAGMENTS = (
     "connection already closed",
@@ -60,6 +63,8 @@ _CONNECTION_ERROR_FRAGMENTS = (
     "connection reset",
     "connection refused",
     "eof detected",
+    "unexpected eof",
+    "eof while reading",
     "server closed",
     "ssl connection has been closed",
     "terminating connection",
@@ -95,6 +100,15 @@ class OutputData(BaseModel):
 class _FilterBuildResult:
     expression: str
     params: List[Any]
+
+
+@dataclass(frozen=True)
+class _VectorIndexInfo:
+    index_type: str
+    metric: Optional[str]
+    indexed_column: Optional[str]
+    is_valid: bool
+    is_usable: bool
 
 
 @dataclass
@@ -226,28 +240,37 @@ class GaussDB(VectorStoreBase):
             collections = self.list_cols()
             if self.collection_name not in collections:
                 self.create_col()
-            elif self.bm25_enabled:
-                # Collection exists; verify a BM25 index is actually usable
-                # rather than assuming bm25_enabled from deployment_mode alone.
-                with self._get_cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT 1
-                        FROM pg_index pi
-                        JOIN pg_class idx_cls ON pi.indexrelid = idx_cls.oid
-                        JOIN pg_am am ON idx_cls.relam = am.oid
-                        JOIN pg_class tbl_cls ON pi.indrelid = tbl_cls.oid
-                        JOIN pg_namespace ns ON tbl_cls.relnamespace = ns.oid
-                        WHERE ns.nspname = %s
-                          AND tbl_cls.relname = %s
-                          AND am.amname = 'bm25'
-                          AND pi.indisvalid IS TRUE
-                          AND pi.indisusable IS TRUE
-                        """,
-                        (self.schema_name, self.collection_name),
-                    )
-                    self.bm25_enabled = cur.fetchone() is not None
-                    self.capabilities.bm25 = self.bm25_enabled
+            else:
+                with self._get_cursor(commit=True) as cur:
+                    self._ensure_existing_vector_dimension(cur, self.embedding_model_dims)
+                    self._create_vector_index(cur, self.table_name, embedding_dims=self.embedding_model_dims)
+                    if self.bm25_enabled:
+                        # Collection exists; verify a BM25 index is actually usable
+                        # rather than assuming bm25_enabled from deployment_mode alone.
+                        cur.execute(
+                            """
+                            SELECT 1
+                            FROM pg_index pi
+                            JOIN pg_class idx_cls ON pi.indexrelid = idx_cls.oid
+                            JOIN pg_am am ON idx_cls.relam = am.oid
+                            JOIN pg_class tbl_cls ON pi.indrelid = tbl_cls.oid
+                            JOIN pg_namespace ns ON tbl_cls.relnamespace = ns.oid
+                            WHERE ns.nspname = %s
+                              AND tbl_cls.relname = %s
+                              AND am.amname = 'bm25'
+                              AND pi.indisvalid IS TRUE
+                              AND pi.indisusable IS TRUE
+                            """,
+                            (self.schema_name, self.collection_name),
+                        )
+                        self.bm25_enabled = cur.fetchone() is not None
+                        self.capabilities.bm25 = self.bm25_enabled
+        elif self.collection_name in self.list_cols():
+            # ``auto_create=False`` must remain read-only: it may verify an
+            # existing collection, but must never create or repair its index.
+            with self._get_cursor() as cur:
+                self._ensure_existing_vector_dimension(cur, self.embedding_model_dims)
+                self._validate_existing_vector_index(cur)
 
     @staticmethod
     def _validate_choice(value: str, field_name: str, choices: set[str]) -> str:
@@ -605,6 +628,7 @@ class GaussDB(VectorStoreBase):
         def op():
             with self._get_cursor(commit=True) as cur:
                 self._ensure_schema(cur)
+                self._ensure_existing_vector_dimension(cur, dims)
                 cur.execute(
                     f"""
                     CREATE TABLE IF NOT EXISTS {table} (
@@ -618,6 +642,10 @@ class GaussDB(VectorStoreBase):
                     ) {self._create_table_suffix_sql("id")}
                     """
                 )
+                # Another process may have created this table after the first
+                # probe. Re-read the physical dimension before creating or
+                # accepting indexes for it.
+                self._ensure_existing_vector_dimension(cur, dims)
                 if self.deployment_mode != "distributed":
                     self.bm25_enabled = True
                     self.capabilities.bm25 = True
@@ -625,7 +653,134 @@ class GaussDB(VectorStoreBase):
 
         return self._run_with_retry("create_col", op)
 
+    def _ensure_existing_vector_dimension(self, cur, expected_dims: int) -> None:
+        existing_dims = self._existing_vector_dimension(cur)
+        if existing_dims is not None and existing_dims != expected_dims:
+            raise ValueError(
+                f"Existing GaussDB collection {self.collection_name!r} has vector dimension "
+                f"{existing_dims}, but embedding_model_dims={expected_dims}. Use a different "
+                "collection_name for a different embedding model dimension, or recreate "
+                "the collection."
+            )
+
+    def _existing_vector_dimension(self, cur) -> Optional[int]:
+        cur.execute(
+            """
+            SELECT a.atttypmod
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s
+              AND c.relname = %s
+              AND a.attname = 'vector'
+              AND NOT a.attisdropped
+            """,
+            (self.schema_name, self.collection_name),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        raw_dimension = row[0]
+        if isinstance(raw_dimension, bool):
+            return None
+        if isinstance(raw_dimension, int):
+            dimension = raw_dimension
+        elif isinstance(raw_dimension, str) and raw_dimension.strip().isdigit():
+            dimension = int(raw_dimension.strip())
+        else:
+            return None
+        return dimension if dimension > 0 else None
+
+    @staticmethod
+    def _vector_metric_from_operator_class(operator_class: Optional[str]) -> Optional[str]:
+        if not isinstance(operator_class, str):
+            return None
+        normalized = re.sub(r"[^a-z0-9]+", "", operator_class.lower())
+        if "cosine" in normalized:
+            return "cosine"
+        if "l2" in normalized:
+            return "l2"
+        return None
+
+    def _existing_vector_index(self, cur) -> Optional[_VectorIndexInfo]:
+        index_name = self._index_name(self.collection_name, "vector_idx")
+        cur.execute(
+            """
+            SELECT am.amname,
+                   pi.indisvalid,
+                   pi.indisusable,
+                   opc.opcname,
+                   a.attname
+            FROM pg_index pi
+            JOIN pg_class idx_cls ON pi.indexrelid = idx_cls.oid
+            JOIN pg_class tbl_cls ON pi.indrelid = tbl_cls.oid
+            JOIN pg_namespace ns ON tbl_cls.relnamespace = ns.oid
+            JOIN pg_am am ON idx_cls.relam = am.oid
+            JOIN pg_opclass opc ON opc.oid = pi.indclass[0]
+            LEFT JOIN pg_attribute a
+              ON a.attrelid = pi.indrelid
+             AND a.attnum = pi.indkey[0]
+             AND NOT a.attisdropped
+            WHERE ns.nspname = %s
+              AND tbl_cls.relname = %s
+              AND idx_cls.relname = %s
+            """,
+            (self.schema_name, self.collection_name, index_name),
+        )
+        row = cur.fetchone()
+        if not isinstance(row, (tuple, list)) or len(row) < 5:
+            return None
+        index_type, is_valid, is_usable, operator_class, indexed_column = row[:5]
+        if not isinstance(index_type, str):
+            return None
+        return _VectorIndexInfo(
+            index_type=index_type.lower(),
+            metric=self._vector_metric_from_operator_class(operator_class),
+            indexed_column=indexed_column if isinstance(indexed_column, str) else None,
+            is_valid=bool(is_valid),
+            is_usable=bool(is_usable),
+        )
+
+    def _validate_existing_vector_index(self, cur) -> Optional[_VectorIndexInfo]:
+        info = self._existing_vector_index(cur)
+        if info is None:
+            return None
+
+        index_name = self._index_name(self.collection_name, "vector_idx")
+        if info.indexed_column != "vector":
+            actual_column = info.indexed_column if info.indexed_column is not None else "an expression or dropped column"
+            raise ValueError(
+                f"Existing GaussDB vector index {index_name!r} targets column {actual_column}, "
+                "but the canonical vector index must target column vector. Recreate the index explicitly "
+                "before using this collection."
+            )
+        if not info.is_valid or not info.is_usable:
+            raise ValueError(
+                f"Existing GaussDB vector index {index_name!r} is invalid or unusable. "
+                "Recreate the index explicitly before using this collection."
+            )
+        if info.index_type != self.vector_index_type:
+            raise ValueError(
+                f"Existing GaussDB vector index {index_name!r} uses access method {info.index_type}, "
+                f"but vector_index_type={self.vector_index_type}. Use a different collection_name or "
+                "recreate the index explicitly."
+            )
+        if info.metric is None:
+            raise ValueError(
+                f"Existing GaussDB vector index {index_name!r} has an unrecognized vector metric. "
+                "Recreate the index explicitly before using this collection."
+            )
+        if info.metric != self.vector_metric:
+            raise ValueError(
+                f"Existing GaussDB vector index {index_name!r} uses vector metric {info.metric}, "
+                f"but vector_metric={self.vector_metric}. Use a different collection_name or recreate "
+                "the index explicitly."
+            )
+        return info
+
     def _create_vector_index(self, cur, table: str, embedding_dims: Optional[int] = None):
+        if self._validate_existing_vector_index(cur) is not None:
+            return
         index_name = self._quote_identifier(self._index_name(self.collection_name, "vector_idx"))
         self._set_vector_index_maintenance_work_mem(cur, embedding_dims=embedding_dims)
         with_clause = self._vector_index_with_clause(embedding_dims=embedding_dims)
@@ -637,6 +792,11 @@ class GaussDB(VectorStoreBase):
             {with_clause}
             """
         )
+        if self._validate_existing_vector_index(cur) is None:
+            raise ValueError(
+                f"GaussDB vector index {self._index_name(self.collection_name, 'vector_idx')!r} "
+                "was not found after CREATE INDEX. Verify the collection schema and recreate the index explicitly."
+            )
 
     def _vector_index_with_clause(self, embedding_dims: Optional[int] = None) -> str:
         """Build WITH clause for vector index. High-dim GsDiskANN needs enable_vector_copy=false + subgraph_count>0."""
@@ -1096,6 +1256,7 @@ class GaussDB(VectorStoreBase):
             with self._get_cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {self.table_name}")
                 row_count = cur.fetchone()[0]
+                vector_index = self._existing_vector_index(cur)
                 cur.execute(
                     """
                     SELECT indexname
@@ -1116,8 +1277,12 @@ class GaussDB(VectorStoreBase):
                 "filter_storage_mode": self.filter_storage_mode,
                 "deployment_mode": self.deployment_mode,
                 "distribution_mode": self.distribution_mode,
-                "vector_index_type": self.vector_index_type,
-                "vector_metric": self.vector_metric,
+                "vector_index_type": (
+                    vector_index.index_type if vector_index and vector_index.indexed_column == "vector" else None
+                ),
+                "vector_metric": vector_index.metric if vector_index and vector_index.indexed_column == "vector" else None,
+                "requested_vector_index_type": self.vector_index_type,
+                "requested_vector_metric": self.vector_metric,
                 "bm25_enabled": self.bm25_enabled,
                 "indexes": indexes,
             }
@@ -1191,23 +1356,33 @@ class GaussDB(VectorStoreBase):
             if normalized_key in {"AND", "OR"}:
                 if not isinstance(value, list):
                     raise ValueError(f"{normalized_key} filter value must be a list")
+                if normalized_key == "OR" and not value:
+                    raise ValueError("Empty OR filter is not allowed")
                 sub_expressions = []
                 for item in value:
                     result = self._build_filter_expression_result(item)
                     if result.expression:
                         sub_expressions.append(f"({result.expression})")
                         params.extend(result.params)
+                if normalized_key == "OR" and not sub_expressions:
+                    raise ValueError("OR filter must contain at least one non-empty condition")
                 if sub_expressions:
                     joiner = " AND " if normalized_key == "AND" else " OR "
                     expressions.append(f"({joiner.join(sub_expressions)})")
             elif normalized_key == "NOT":
                 if not isinstance(value, list):
                     raise ValueError("NOT filter value must be a list")
+                if not value:
+                    raise ValueError("Empty NOT filter is not allowed")
+                has_condition = False
                 for item in value:
                     result = self._build_filter_expression_result(item)
                     if result.expression:
+                        has_condition = True
                         expressions.append(f"(({result.expression}) IS NOT TRUE)")
                         params.extend(result.params)
+                if not has_condition:
+                    raise ValueError("NOT filter must contain at least one non-empty condition")
             else:
                 result = self._build_field_filter_result(normalized_key, value)
                 if result.expression:
