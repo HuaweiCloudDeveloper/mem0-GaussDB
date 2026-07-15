@@ -26,13 +26,71 @@ def make_gaussdb(**kwargs):
     }
     config.update(kwargs)
 
-    with patch.object(GaussDB, "_create_connection_pool", return_value=mock_pool):
+    with (
+        patch.object(GaussDB, "_create_connection_pool", return_value=mock_pool),
+        patch.object(GaussDB, "list_cols", return_value=[]),
+    ):
         db = GaussDB(**config)
     return db, mock_pool, mock_conn, mock_cursor
 
 
 def executed_sql(mock_cursor):
     return "\n".join(str(call.args[0]) for call in mock_cursor.execute.call_args_list)
+
+
+def canonical_vector_index_row():
+    return (
+        "gsdiskann",
+        True,
+        True,
+        "floatvector_cosine_ops",
+        "vector",
+    )
+
+
+def set_missing_vector_index_then_created(mock_cursor, existing_dimension=None, resulting_dimension=3):
+    mock_cursor.fetchone.side_effect = [
+        (existing_dimension,) if existing_dimension is not None else None,
+        (resulting_dimension,),
+        None,
+        ("64MB",),
+        canonical_vector_index_row(),
+    ]
+
+
+def test_existing_vector_index_reads_only_required_catalog_fields():
+    db, *_ = make_gaussdb()
+    cur = MagicMock()
+    cur.fetchone.return_value = (
+        "gsdiskann",
+        True,
+        True,
+        "floatvector_cosine_ops",
+        "vector",
+    )
+
+    info = db._existing_vector_index(cur)
+
+    assert info is not None
+    assert info.index_type == "gsdiskann"
+    assert info.metric == "cosine"
+    assert info.indexed_column == "vector"
+    sql = executed_sql(cur)
+    assert "opc.opcintype" not in sql
+    assert "pg_get_indexdef" not in sql
+
+
+@pytest.mark.parametrize("operator_class", [None, 42, object()])
+def test_vector_metric_from_operator_class_ignores_non_string_catalog_values(operator_class):
+    assert GaussDB._vector_metric_from_operator_class(operator_class) is None
+
+
+def test_existing_vector_index_ignores_catalog_row_without_string_access_method():
+    db, *_ = make_gaussdb()
+    cur = MagicMock()
+    cur.fetchone.return_value = (42, True, True, "floatvector_cosine_ops", "vector")
+
+    assert db._existing_vector_index(cur) is None
 
 
 class DummyMap:
@@ -357,6 +415,7 @@ def test_rejects_high_dims_with_gsivfflat():
 
 def test_create_col_generates_ustore_vector_bm25_and_filter_indexes():
     db, _, mock_conn, mock_cursor = make_gaussdb()
+    set_missing_vector_index_then_created(mock_cursor)
 
     db.create_col()
 
@@ -379,8 +438,86 @@ def test_create_col_generates_ustore_vector_bm25_and_filter_indexes():
     mock_conn.commit.assert_called()
 
 
+def test_create_col_rejects_existing_collection_dimension_mismatch():
+    db, _, _, mock_cursor = make_gaussdb(embedding_model_dims=3)
+    mock_cursor.fetchone.return_value = (4,)
+
+    with pytest.raises(ValueError, match="Existing GaussDB collection .* vector dimension 4"):
+        db.create_col()
+
+
+def test_create_col_rechecks_dimension_after_concurrent_table_creation():
+    """A table created after the first probe must not bypass dimension validation."""
+    db, _, _, mock_cursor = make_gaussdb(embedding_model_dims=3)
+    mock_cursor.fetchone.side_effect = [None, (4,)]
+
+    with patch.object(db, "_ensure_indexes") as ensure_indexes:
+        with pytest.raises(ValueError, match="Existing GaussDB collection .* vector dimension 4"):
+            db.create_col()
+
+    assert "CREATE TABLE IF NOT EXISTS" in executed_sql(mock_cursor)
+    ensure_indexes.assert_not_called()
+
+
+def test_create_col_rejects_dimension_mismatch_for_telemetry_collection():
+    db, _, mock_conn, mock_cursor = make_gaussdb(collection_name="mem0migrations", embedding_model_dims=3)
+    mock_cursor.fetchone.return_value = (4,)
+
+    with pytest.raises(ValueError, match="Existing GaussDB collection .* vector dimension 4"):
+        db.create_col()
+
+    sql = executed_sql(mock_cursor)
+    assert "a.atttypmod" in sql
+    assert "CREATE TABLE IF NOT EXISTS" not in sql
+    mock_conn.commit.assert_not_called()
+
+
+def test_create_col_accepts_existing_collection_same_dimension():
+    db, _, mock_conn, mock_cursor = make_gaussdb(embedding_model_dims=3)
+    set_missing_vector_index_then_created(mock_cursor, existing_dimension=3)
+
+    db.create_col()
+
+    sql = executed_sql(mock_cursor)
+    assert "CREATE TABLE IF NOT EXISTS" in sql
+    assert "FLOATVECTOR(3)" in sql
+    mock_conn.commit.assert_called()
+
+
+def test_existing_vector_dimension_parses_typmod_and_ignores_unknown():
+    db, _, _, mock_cursor = make_gaussdb()
+
+    mock_cursor.fetchone.return_value = (1,)
+    assert db._existing_vector_dimension(mock_cursor) == 1
+
+    mock_cursor.fetchone.return_value = ("3",)
+    assert db._existing_vector_dimension(mock_cursor) == 3
+
+    mock_cursor.fetchone.return_value = (" 4 ",)
+    assert db._existing_vector_dimension(mock_cursor) == 4
+
+    mock_cursor.fetchone.return_value = ("floatvector(3)",)
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+    mock_cursor.fetchone.return_value = (True,)
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+    mock_cursor.fetchone.return_value = (0,)
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+    mock_cursor.fetchone.return_value = (-1,)
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+    mock_cursor.fetchone.return_value = (1.5,)
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+    mock_cursor.fetchone.return_value = None
+    assert db._existing_vector_dimension(mock_cursor) is None
+
+
 def test_create_col_rejects_alternate_collection_name_but_accepts_matching_name():
-    db, _, _, _ = make_gaussdb()
+    db, _, _, mock_cursor = make_gaussdb()
+    set_missing_vector_index_then_created(mock_cursor)
 
     db.create_col(name=db.collection_name)
 
@@ -393,6 +530,7 @@ def test_create_col_rejects_alternate_collection_name_but_accepts_matching_name(
 
 def test_distributed_create_col_generates_hash_distribution_clauses():
     db, _, _, mock_cursor = make_gaussdb(deployment_mode="distributed")
+    set_missing_vector_index_then_created(mock_cursor)
 
     db.create_col()
 
@@ -510,6 +648,7 @@ def test_bm25_index_failure_rolls_back_and_disables_bm25():
 
 def test_create_col_keeps_collection_when_bm25_index_fails():
     db, _, mock_conn, mock_cursor = make_gaussdb()
+    set_missing_vector_index_then_created(mock_cursor)
 
     def execute_side_effect(sql, *args):
         if "USING bm25" in str(sql):
@@ -1369,8 +1508,17 @@ def test_list_top_k_zero_is_preserved():
 
 
 def test_col_info_reads_indexes_and_capabilities():
-    db, _, _, mock_cursor = make_gaussdb()
-    mock_cursor.fetchone.side_effect = [(3,)]
+    db, _, _, mock_cursor = make_gaussdb(vector_index_type="gsivfflat", vector_metric="l2")
+    mock_cursor.fetchone.side_effect = [
+        (3,),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_cosine_ops",
+            "vector",
+        ),
+    ]
     mock_cursor.fetchall.return_value = [("test_collection_vector_idx",), ("test_collection_bm25_idx",)]
 
     info = db.col_info()
@@ -1379,6 +1527,50 @@ def test_col_info_reads_indexes_and_capabilities():
     assert info["deployment_mode"] == "centralized"
     assert info["distribution_mode"] == "none"
     assert info["indexes"] == ["test_collection_vector_idx", "test_collection_bm25_idx"]
+    assert info["vector_index_type"] == "gsdiskann"
+    assert info["vector_metric"] == "cosine"
+    assert info["requested_vector_index_type"] == "gsivfflat"
+    assert info["requested_vector_metric"] == "l2"
+
+
+def test_col_info_does_not_report_canonical_index_on_another_vector_column():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchone.side_effect = [
+        (3,),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_cosine_ops",
+            "other_vector",
+        ),
+    ]
+    mock_cursor.fetchall.return_value = [("test_collection_vector_idx",)]
+
+    info = db.col_info()
+
+    assert info["vector_index_type"] is None
+    assert info["vector_metric"] is None
+
+
+def test_col_info_does_not_report_expression_or_dropped_column_as_vector_index():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchone.side_effect = [
+        (3,),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_cosine_ops",
+            None,
+        ),
+    ]
+    mock_cursor.fetchall.return_value = [("test_collection_vector_idx",)]
+
+    info = db.col_info()
+
+    assert info["vector_index_type"] is None
+    assert info["vector_metric"] is None
 
 
 # ============================================================
@@ -1480,6 +1672,8 @@ def test_is_retryable_classifies_known_fragments():
     assert GaussDB._is_retryable(Exception("could not serialize access")) is True
     assert GaussDB._is_retryable(Exception("server closed the connection")) is True
     assert GaussDB._is_retryable(Exception("terminating connection")) is True
+    assert GaussDB._is_retryable(Exception("SSL error: unexpected eof while reading")) is True
+    assert GaussDB._is_retryable(Exception("memory is temporarily unavailable")) is True
     assert GaussDB._is_retryable(Exception("syntax error")) is False
     assert GaussDB._is_retryable(Exception("unique violation")) is False
 
@@ -1639,6 +1833,17 @@ def test_get_cursor_discards_closed_connection_after_error():
     with pytest.raises(RuntimeError, match="boom"):
         with db._get_cursor(commit=False):
             raise RuntimeError("boom")
+
+    mock_conn.rollback.assert_called()
+    mock_pool.putconn.assert_called_with(mock_conn, close=True)
+
+
+def test_get_cursor_discards_connection_after_ssl_eof_error():
+    db, mock_pool, mock_conn, _ = make_gaussdb()
+
+    with pytest.raises(RuntimeError, match="unexpected eof"):
+        with db._get_cursor(commit=False):
+            raise RuntimeError("SSL error: unexpected eof while reading")
 
     mock_conn.rollback.assert_called()
     mock_pool.putconn.assert_called_with(mock_conn, close=True)
@@ -1849,11 +2054,205 @@ def test_create_col_builds_table_and_indexes():
 def test_create_vector_index_emits_expected_sql():
     db, *_ = make_gaussdb()
     cur = MagicMock()
+    cur.fetchone.side_effect = [
+        None,
+        ("64MB",),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_cosine_ops",
+            "vector",
+        ),
+    ]
 
     db._create_vector_index(cur, db.table_name)
 
     sqls = executed_sql(cur)
     assert "CREATE INDEX IF NOT EXISTS" in sqls
+
+
+def test_create_vector_index_creates_canonical_index_when_it_is_missing():
+    db, *_ = make_gaussdb()
+    cur = MagicMock()
+    cur.fetchone.side_effect = [
+        None,
+        ("64MB",),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_cosine_ops",
+            "vector",
+        ),
+    ]
+
+    db._create_vector_index(cur, db.table_name)
+
+    sqls = executed_sql(cur)
+    assert "FROM pg_index pi" in sqls
+    assert "idx_cls.relname = %s" in sqls
+    assert "pg_get_indexdef" not in sqls
+    assert "CREATE INDEX IF NOT EXISTS" in sqls
+
+
+def test_create_vector_index_rejects_existing_access_method_mismatch():
+    db, *_ = make_gaussdb(vector_index_type="gsivfflat")
+    cur = MagicMock()
+    cur.fetchone.return_value = (
+        "gsdiskann",
+        True,
+        True,
+        "floatvector_cosine_ops",
+        "vector",
+    )
+
+    with pytest.raises(ValueError, match="access method gsdiskann.*vector_index_type=gsivfflat"):
+        db._create_vector_index(cur, db.table_name)
+
+    assert "CREATE INDEX" not in executed_sql(cur)
+
+
+def test_create_vector_index_rejects_canonical_name_targeting_another_vector_column():
+    db, *_ = make_gaussdb()
+    cur = MagicMock()
+    cur.fetchone.return_value = (
+        "gsdiskann",
+        True,
+        True,
+        "floatvector_cosine_ops",
+        "other_vector",
+    )
+
+    with pytest.raises(ValueError, match="targets column other_vector.*target column vector"):
+        db._create_vector_index(cur, db.table_name)
+
+    assert "CREATE INDEX" not in executed_sql(cur)
+
+
+def test_create_vector_index_rechecks_and_rejects_absent_index_after_create():
+    db, *_ = make_gaussdb()
+    cur = MagicMock()
+    cur.fetchone.side_effect = [None, ("64MB",), None]
+
+    with pytest.raises(ValueError, match="was not found after CREATE INDEX"):
+        db._create_vector_index(cur, db.table_name)
+
+    assert "CREATE INDEX IF NOT EXISTS" in executed_sql(cur)
+
+
+def test_create_vector_index_rechecks_and_rejects_incompatible_index_after_create():
+    db, *_ = make_gaussdb(vector_index_type="gsivfflat")
+    cur = MagicMock()
+    cur.fetchone.side_effect = [
+        None,
+        ("64MB",),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_cosine_ops",
+            "vector",
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="access method gsdiskann.*vector_index_type=gsivfflat"):
+        db._create_vector_index(cur, db.table_name)
+
+    assert "CREATE INDEX IF NOT EXISTS" in executed_sql(cur)
+
+
+def test_create_vector_index_rechecks_and_rejects_wrong_target_after_create():
+    db, *_ = make_gaussdb()
+    cur = MagicMock()
+    cur.fetchone.side_effect = [
+        None,
+        ("64MB",),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_cosine_ops",
+            "other_vector",
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="targets column other_vector.*target column vector"):
+        db._create_vector_index(cur, db.table_name)
+
+    assert "CREATE INDEX IF NOT EXISTS" in executed_sql(cur)
+
+
+def test_create_vector_index_rejects_expression_or_dropped_column_target():
+    db, *_ = make_gaussdb()
+    cur = MagicMock()
+    cur.fetchone.return_value = (
+        "gsdiskann",
+        True,
+        True,
+        "floatvector_cosine_ops",
+        None,
+    )
+
+    with pytest.raises(ValueError, match="an expression or dropped column.*target column vector"):
+        db._create_vector_index(cur, db.table_name)
+
+    assert "CREATE INDEX" not in executed_sql(cur)
+
+
+def test_create_vector_index_reads_l2_metric_from_operator_class():
+    db, *_ = make_gaussdb(vector_metric="l2")
+    cur = MagicMock()
+    cur.fetchone.return_value = (
+        "gsdiskann",
+        True,
+        True,
+        "floatvector_l2_ops",
+        "vector",
+    )
+
+    db._create_vector_index(cur, db.table_name)
+
+    sqls = executed_sql(cur)
+    assert "JOIN pg_opclass opc ON opc.oid = pi.indclass[0]" in sqls
+    assert "opc.opcname" in sqls
+    assert "opc.opcintype" not in sqls
+    assert "CREATE INDEX" not in sqls
+
+
+def test_create_vector_index_rejects_unknown_operator_class():
+    db, *_ = make_gaussdb(vector_metric="l2")
+    cur = MagicMock()
+    cur.fetchone.return_value = (
+        "gsdiskann",
+        True,
+        True,
+        "floatvector_unknown_ops",
+        "vector",
+    )
+
+    with pytest.raises(ValueError, match="unrecognized vector metric"):
+        db._create_vector_index(cur, db.table_name)
+
+    assert "CREATE INDEX" not in executed_sql(cur)
+
+
+@pytest.mark.parametrize(("is_valid", "is_usable"), [(False, True), (True, False)])
+def test_create_vector_index_rejects_invalid_or_unusable_canonical_index(is_valid, is_usable):
+    db, *_ = make_gaussdb()
+    cur = MagicMock()
+    cur.fetchone.return_value = (
+        "gsdiskann",
+        is_valid,
+        is_usable,
+        "floatvector_cosine_ops",
+        "vector",
+    )
+
+    with pytest.raises(ValueError, match="invalid or unusable"):
+        db._create_vector_index(cur, db.table_name)
+
+    assert "CREATE INDEX" not in executed_sql(cur)
 
 
 def test_vector_index_with_clause_and_maintenance_mem_paths():
@@ -2074,7 +2473,7 @@ def test_update_delete_get_list_reset_and_col_helpers():
 
     cur_cm = MagicMock()
     cur = MagicMock()
-    cur.fetchone.side_effect = [("id1", '{"a":1}'), None, (5,)]
+    cur.fetchone.side_effect = [("id1", '{"a":1}'), None, (5,), None]
     cur.fetchall.side_effect = [
         [("table_a",), ("table_b",)],
         [("idx_a",), ("idx_b",)],
@@ -2103,6 +2502,93 @@ def test_update_delete_get_list_reset_and_col_helpers():
 def test_build_where_clause_returns_empty_for_missing_filters():
     db, *_ = make_gaussdb()
     assert db._build_where_clause(None) == ("", [])
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        pytest.param({"OR": []}, id="upper_or"),
+        pytest.param({"$or": []}, id="dollar_or"),
+        pytest.param({"NOT": []}, id="upper_not"),
+        pytest.param({"$not": []}, id="dollar_not"),
+    ],
+)
+def test_empty_disjunctive_and_negation_filters_are_rejected_before_sql(filters):
+    db, _, _, mock_cursor = make_gaussdb()
+
+    with pytest.raises(ValueError, match="Empty (OR|NOT) filter is not allowed"):
+        db.list(filters=filters)
+
+    mock_cursor.execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        pytest.param({"OR": [{}]}, id="upper_or_empty_mapping"),
+        pytest.param({"$or": [{}]}, id="dollar_or_empty_mapping"),
+        pytest.param({"NOT": [{}]}, id="upper_not_empty_mapping"),
+        pytest.param({"$not": [{}]}, id="dollar_not_empty_mapping"),
+        pytest.param({"OR": [{"AND": []}]}, id="upper_or_empty_and"),
+        pytest.param({"NOT": [{"AND": []}]}, id="upper_not_empty_and"),
+        pytest.param({"$or": [{"$and": []}]}, id="dollar_or_empty_and"),
+        pytest.param({"$not": [{"$and": []}]}, id="dollar_not_empty_and"),
+    ],
+)
+def test_logical_filters_reject_non_empty_lists_without_concrete_conditions_before_sql(filters):
+    db, _, _, mock_cursor = make_gaussdb()
+
+    with pytest.raises(ValueError, match="(OR|NOT) filter must contain at least one non-empty condition"):
+        db.list(filters=filters)
+
+    mock_cursor.execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("filters", "expected_expression"),
+    [
+        pytest.param(
+            {"OR": [{"AND": []}, {"user_id": "u"}]},
+            '(("user_id" = %s))',
+            id="upper_or",
+        ),
+        pytest.param(
+            {"$or": [{"$and": []}, {"user_id": "u"}]},
+            '(("user_id" = %s))',
+            id="dollar_or",
+        ),
+        pytest.param(
+            {"NOT": [{"AND": []}, {"user_id": "u"}]},
+            '(("user_id" = %s) IS NOT TRUE)',
+            id="upper_not",
+        ),
+        pytest.param(
+            {"$not": [{"$and": []}, {"user_id": "u"}]},
+            '(("user_id" = %s) IS NOT TRUE)',
+            id="dollar_not",
+        ),
+    ],
+)
+def test_logical_filters_ignore_empty_and_child_when_a_concrete_condition_exists(filters, expected_expression):
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    assert db._build_filter_expression(filters) == (expected_expression, ["u"])
+    db.list(filters=filters)
+
+    assert f"WHERE {expected_expression}" in executed_sql(mock_cursor)
+
+
+@pytest.mark.parametrize("filters", [{"AND": []}, {"$and": []}])
+def test_empty_and_filter_preserves_identity_behavior(filters):
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    assert db._build_filter_expression(filters) == ("", [])
+    assert db._build_where_clause(filters) == ("", [])
+    db.list(filters=filters)
+
+    assert "WHERE" not in executed_sql(mock_cursor)
 
 
 def test_build_filter_expression_and_field_helpers_cover_error_and_edge_paths():
@@ -2183,8 +2669,19 @@ def test_init_auto_create_verifies_bm25_present_when_collection_exists():
     mock_conn.get_parameter_status.return_value = "UTF8"
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
-    # fetchone returns a row -> usable BM25 index exists
-    mock_cursor.fetchone.return_value = (1,)
+    # fetchone sequence: existing vector dimension, canonical vector index,
+    # then usable BM25 index row.
+    mock_cursor.fetchone.side_effect = [
+        (3,),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_cosine_ops",
+            "vector",
+        ),
+        (1,),
+    ]
     mock_cursor.fetchall.return_value = []
     mock_pool = MagicMock()
     mock_pool.getconn.return_value = mock_conn
@@ -2198,9 +2695,9 @@ def test_init_auto_create_verifies_bm25_present_when_collection_exists():
 
     assert db.bm25_enabled is True
     assert db.capabilities.bm25 is True
-    # Verify the probe checks the real index access method and usable state,
-    # not only the index definition text.
+    # Verify the probe checks real catalog metadata, rather than configured values.
     sql = executed_sql(mock_cursor)
+    assert "a.atttypmod" in sql
     assert "FROM pg_index pi" in sql
     assert "JOIN pg_am am" in sql
     assert "am.amname = 'bm25'" in sql
@@ -2214,8 +2711,19 @@ def test_init_auto_create_detects_bm25_absent_when_collection_exists():
     mock_conn.get_parameter_status.return_value = "UTF8"
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
-    # fetchone returns None -> no valid/usable BM25 index found
-    mock_cursor.fetchone.return_value = None
+    # fetchone sequence: existing vector dimension, canonical vector index,
+    # then no valid/usable BM25 index found.
+    mock_cursor.fetchone.side_effect = [
+        (3,),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_cosine_ops",
+            "vector",
+        ),
+        None,
+    ]
     mock_cursor.fetchall.return_value = []
     mock_pool = MagicMock()
     mock_pool.getconn.return_value = mock_conn
@@ -2230,11 +2738,187 @@ def test_init_auto_create_detects_bm25_absent_when_collection_exists():
     assert db.bm25_enabled is False
     assert db.capabilities.bm25 is False
     sql = executed_sql(mock_cursor)
+    assert "a.atttypmod" in sql
     assert "FROM pg_index pi" in sql
     assert "JOIN pg_am am" in sql
     assert "am.amname = 'bm25'" in sql
     assert "pi.indisvalid IS TRUE" in sql
     assert "pi.indisusable IS TRUE" in sql
+
+
+def test_init_auto_create_rejects_existing_collection_dimension_mismatch():
+    mock_conn = MagicMock()
+    mock_conn.get_parameter_status.return_value = "UTF8"
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.return_value = (4,)
+    mock_cursor.fetchall.return_value = []
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+
+    with (
+        patch.object(GaussDB, "_create_connection_pool", return_value=mock_pool),
+        patch.object(GaussDB, "list_cols", return_value=["test_collection"]),
+        patch.object(GaussDB, "create_col") as create_col,
+        pytest.raises(ValueError, match="Existing GaussDB collection .* vector dimension 4"),
+    ):
+        GaussDB(collection_name="test_collection", embedding_model_dims=3, auto_create=True)
+
+    create_col.assert_not_called()
+    sql = executed_sql(mock_cursor)
+    assert "a.atttypmod" in sql
+    assert "FROM pg_index pi" not in sql
+
+
+def test_init_auto_create_rejects_existing_vector_metric_mismatch():
+    mock_conn = MagicMock()
+    mock_conn.get_parameter_status.return_value = "UTF8"
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.side_effect = [
+        (3,),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_cosine_ops",
+            "vector",
+        ),
+    ]
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+
+    with (
+        patch.object(GaussDB, "_create_connection_pool", return_value=mock_pool),
+        patch.object(GaussDB, "list_cols", return_value=["test_collection"]),
+        patch.object(GaussDB, "create_col") as create_col,
+        pytest.raises(ValueError, match="vector metric cosine.*vector_metric=l2"),
+    ):
+        GaussDB(collection_name="test_collection", embedding_model_dims=3, vector_metric="l2", auto_create=True)
+
+    create_col.assert_not_called()
+    assert "CREATE INDEX" not in executed_sql(mock_cursor)
+
+
+def test_init_auto_create_reopens_l2_collection():
+    mock_conn = MagicMock()
+    mock_conn.get_parameter_status.return_value = "UTF8"
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.side_effect = [
+        (3,),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_l2_ops",
+            "vector",
+        ),
+        (1,),
+    ]
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+
+    with (
+        patch.object(GaussDB, "_create_connection_pool", return_value=mock_pool),
+        patch.object(GaussDB, "list_cols", return_value=["test_collection"]),
+    ):
+        db = GaussDB(collection_name="test_collection", embedding_model_dims=3, vector_metric="l2", auto_create=True)
+
+    assert db.vector_metric == "l2"
+    assert "CREATE INDEX" not in executed_sql(mock_cursor)
+
+
+def test_init_without_auto_create_rejects_existing_vector_metric_mismatch():
+    mock_conn = MagicMock()
+    mock_conn.get_parameter_status.return_value = "UTF8"
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.side_effect = [
+        (3,),
+        (
+            "gsdiskann",
+            True,
+            True,
+            "floatvector_cosine_ops",
+            "vector",
+        ),
+    ]
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+
+    with (
+        patch.object(GaussDB, "_create_connection_pool", return_value=mock_pool),
+        patch.object(GaussDB, "list_cols", return_value=["test_collection"]),
+        pytest.raises(ValueError, match="vector metric cosine.*vector_metric=l2"),
+    ):
+        GaussDB(collection_name="test_collection", embedding_model_dims=3, vector_metric="l2", auto_create=False)
+
+    assert "CREATE TABLE" not in executed_sql(mock_cursor)
+    assert "CREATE INDEX" not in executed_sql(mock_cursor)
+
+
+def test_init_without_auto_create_allows_existing_collection_missing_canonical_vector_index():
+    mock_conn = MagicMock()
+    mock_conn.get_parameter_status.return_value = "UTF8"
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.side_effect = [(3,), None]
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+
+    with (
+        patch.object(GaussDB, "_create_connection_pool", return_value=mock_pool),
+        patch.object(GaussDB, "list_cols", return_value=["test_collection"]),
+    ):
+        db = GaussDB(collection_name="test_collection", embedding_model_dims=3, auto_create=False)
+
+    assert db.collection_name == "test_collection"
+    assert "CREATE TABLE" not in executed_sql(mock_cursor)
+    assert "CREATE INDEX" not in executed_sql(mock_cursor)
+
+
+def test_init_without_auto_create_allows_missing_collection_without_creating_it():
+    mock_conn = MagicMock()
+    mock_conn.get_parameter_status.return_value = "UTF8"
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+
+    with (
+        patch.object(GaussDB, "_create_connection_pool", return_value=mock_pool),
+        patch.object(GaussDB, "list_cols", return_value=[]),
+    ):
+        db = GaussDB(collection_name="test_collection", embedding_model_dims=3, auto_create=False)
+
+    assert db.collection_name == "test_collection"
+    assert "CREATE TABLE" not in executed_sql(mock_cursor)
+    assert "CREATE INDEX" not in executed_sql(mock_cursor)
+
+
+def test_init_auto_create_rejects_dimension_mismatch_for_telemetry_collection():
+    mock_conn = MagicMock()
+    mock_conn.get_parameter_status.return_value = "UTF8"
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.return_value = (4,)
+    mock_cursor.fetchall.return_value = []
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+
+    with (
+        patch.object(GaussDB, "_create_connection_pool", return_value=mock_pool),
+        patch.object(GaussDB, "list_cols", return_value=["mem0migrations"]),
+        patch.object(GaussDB, "create_col") as create_col,
+        pytest.raises(ValueError, match="Existing GaussDB collection .* vector dimension 4"),
+    ):
+        GaussDB(collection_name="mem0migrations", embedding_model_dims=3, auto_create=True)
+
+    create_col.assert_not_called()
+    sql = executed_sql(mock_cursor)
+    assert "a.atttypmod" in sql
+    assert "FROM pg_index pi" not in sql
 
 
 def test_init_rejects_maxconn_less_than_minconn():
@@ -2293,7 +2977,7 @@ def test_create_col_instance_dims_drive_high_dim_index_settings():
     cur_cm = MagicMock()
     cur = MagicMock()
     cur_cm.__enter__.return_value = cur
-    cur.fetchone.return_value = ("64MB",)
+    set_missing_vector_index_then_created(cur, resulting_dimension=2048)
     with (
         patch.object(db, "_get_cursor", return_value=cur_cm),
         patch.object(db, "_run_with_retry", side_effect=lambda op, func: func()),
@@ -2310,7 +2994,8 @@ def test_create_col_instance_dims_drive_high_dim_index_settings():
 
 
 def test_create_col_vector_size_must_match_embedding_model_dims():
-    db, *_ = make_gaussdb(embedding_model_dims=512)
+    db, _, _, mock_cursor = make_gaussdb(embedding_model_dims=512)
+    set_missing_vector_index_then_created(mock_cursor, resulting_dimension=512)
 
     db.create_col(vector_size=512)
 
