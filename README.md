@@ -42,6 +42,9 @@
   <a href="https://mem0.ai/research"><strong>📄 Benchmarking Mem0's token-efficient memory algorithm →</strong></a>
 </p>
 
+> [!IMPORTANT]
+> **GaussDB users:** this repository contains Huawei Cloud's GaussDB provider. The upstream PyPI command `pip install mem0ai` does **not** install that provider. Follow the [GaussDB installation and usage guide](README_GaussDB_en.md) to install this repository and its required `psycopg2` driver.
+
 ## New Memory Algorithm (April 2026)
 
 | Benchmark | Old | New  | Tokens  | Latency p50  |
@@ -117,6 +120,9 @@ The human owner can claim the account later with `mem0 init --email <their-email
 Just testing? Use the library. Building for a team? Self-hosted. Want zero ops? Cloud.
 
 ### Library (pip / npm)
+
+> [!IMPORTANT]
+> The following PyPI command installs upstream Mem0. If you need the GaussDB vector-store provider, do not use it; install this repository by following the [GaussDB installation and usage guide](README_GaussDB_en.md).
 
 ```bash
 pip install mem0ai
