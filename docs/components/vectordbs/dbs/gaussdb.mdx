@@ -5,6 +5,21 @@ description: "Use GaussDB as a Mem0 vector store with native FLOATVECTOR support
 
 GaussDB can be used as a Mem0 vector store provider for both centralized and distributed deployments.
 
+## Installation
+
+The `gaussdb` provider is distributed in this repository, not in the upstream `mem0ai` package on PyPI. Do not use `pip install mem0ai` when GaussDB support is required.
+
+Install this repository and a GaussDB-compatible `psycopg2` driver instead:
+
+```bash
+python -m pip install "git+https://github.com/huaweicloud-samples/database-mem0-GaussDB.git"
+python -m pip install psycopg2-binary
+```
+
+For development, clone the repository and use `python -m pip install -e .`. In production, use the driver build that is compatible with the target GaussDB deployment; `psycopg2-binary` is intended as a convenient local-development default.
+
+See the [GaussDB installation and usage guide](https://github.com/huaweicloud-samples/database-mem0-GaussDB/blob/main/README_GaussDB_en.md) for prerequisites, an end-to-end `Memory` example, a direct-provider example, and deployment limits.
+
 Current provider highlights:
 
 - native `FLOATVECTOR` storage
